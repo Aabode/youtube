@@ -6,6 +6,7 @@ import time
 import requests
 from requests.exceptions import RequestException
 import os
+import random
 
 app = Flask(__name__)
 
@@ -21,6 +22,10 @@ def get_proxy_session():
     if any(PROXY_CONFIG.values()):
         session.proxies.update(PROXY_CONFIG)
     return session
+
+def random_delay():
+    """Add random delay between requests to avoid rate limiting"""
+    time.sleep(random.uniform(2, 5))
 
 def extract_video_id(url):
     # يدعم جميع أنواع روابط يوتيوب (عادي، شورتس، مع معلمات)
@@ -48,6 +53,10 @@ def get_transcripts():
     if not video_id:
         print("ERROR: Invalid video ID")
         return jsonify({"error": "Invalid URL."}), 400
+    
+    # Add initial delay before first request
+    random_delay()
+    
     try:
         # Create a custom session with proxy support
         session = get_proxy_session()
@@ -74,11 +83,19 @@ def get_transcripts():
         return jsonify({"error": "Video unavailable or invalid URL."}), 404
     except Exception as e:
         print("UNEXPECTED ERROR:", str(e))
+        if "429" in str(e):
+            return jsonify({"error": "تم تجاوز حد الطلبات المسموح به. يرجى المحاولة بعد قليل."}), 429
         return jsonify({"error": "Unexpected error: " + str(e)}), 500
 
-def fetch_transcript_with_retry(video_id, lang_code, retries=3, delay=1):
+def fetch_transcript_with_retry(video_id, lang_code, retries=5, initial_delay=2):
     for attempt in range(retries):
         try:
+            # Add random delay before each attempt
+            if attempt > 0:
+                delay = initial_delay * (2 ** attempt) + random.uniform(1, 3)
+                print(f"Waiting {delay:.2f} seconds before retry {attempt + 1}")
+                time.sleep(delay)
+            
             # Create a custom session with proxy support
             session = get_proxy_session()
             transcript = YouTubeTranscriptApi.get_transcript(
@@ -91,15 +108,18 @@ def fetch_transcript_with_retry(video_id, lang_code, retries=3, delay=1):
         except RequestException as e:
             print(f"Proxy error on attempt {attempt + 1}: {str(e)}")
             if attempt < retries - 1:
-                time.sleep(delay * (attempt + 1))  # Exponential backoff
-            else:
-                return {"error": "فشل الاتصال بالخادم. يرجى التحقق من إعدادات البروكسي."}
+                continue
+            return {"error": "فشل الاتصال بالخادم. يرجى التحقق من إعدادات البروكسي."}
         except Exception as e:
             print(f"Error on attempt {attempt + 1}: {str(e)}")
+            if "429" in str(e):
+                if attempt < retries - 1:
+                    print("Rate limit detected, waiting longer before next attempt...")
+                    continue
+                return {"error": "تم تجاوز حد الطلبات المسموح به. يرجى المحاولة بعد قليل."}
             if attempt < retries - 1:
-                time.sleep(delay * (attempt + 1))
-            else:
-                return {"error": "لا توجد ترجمة متاحة بهذه اللغة."}
+                continue
+            return {"error": "لا توجد ترجمة متاحة بهذه اللغة."}
 
 @app.route("/fetch_transcript", methods=["POST"])
 def fetch_transcript():
