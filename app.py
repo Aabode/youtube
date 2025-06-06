@@ -1,12 +1,10 @@
 from flask import Flask, render_template, request, jsonify, send_file
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
 import re
 import io
 import time
-import requests
-from requests.exceptions import RequestException
 import os
-import random
+import yt_dlp
+import json
 
 app = Flask(__name__)
 
@@ -15,17 +13,6 @@ PROXY_CONFIG = {
     'http': os.getenv('HTTP_PROXY', ''),
     'https': os.getenv('HTTPS_PROXY', '')
 }
-
-# Custom session with proxy support
-def get_proxy_session():
-    session = requests.Session()
-    if any(PROXY_CONFIG.values()):
-        session.proxies.update(PROXY_CONFIG)
-    return session
-
-def random_delay():
-    """Add random delay between requests to avoid rate limiting"""
-    time.sleep(random.uniform(2, 5))
 
 def extract_video_id(url):
     # يدعم جميع أنواع روابط يوتيوب (عادي، شورتس، مع معلمات)
@@ -40,6 +27,18 @@ def extract_video_id(url):
             return match.group(1)
     return None
 
+def get_ydl_opts(proxy=None):
+    """Get yt-dlp options with proxy support"""
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True,
+        'skip_download': True,
+    }
+    if proxy:
+        opts['proxy'] = proxy
+    return opts
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -48,84 +47,83 @@ def index():
 def get_transcripts():
     url = request.json.get("url")
     print("URL RECEIVED:", url)
-    video_id = extract_video_id(url)
-    print("VIDEO ID:", video_id)
-    if not video_id:
-        print("ERROR: Invalid video ID")
+    
+    if not url:
         return jsonify({"error": "Invalid URL."}), 400
-    
-    # Add initial delay before first request
-    random_delay()
-    
-    try:
-        # Create a custom session with proxy support
-        session = get_proxy_session()
-        transcript_list = YouTubeTranscriptApi.list_transcripts(
-            video_id,
-            proxies=PROXY_CONFIG if any(PROXY_CONFIG.values()) else None
-        )
-        languages = [
-            {"code": t.language_code, "name": t.language} for t in transcript_list._manually_created_transcripts.values()
-        ]
-        # إضافة الترجمات التلقائية
-        for t in transcript_list._generated_transcripts.values():
-            languages.append({"code": t.language_code, "name": t.language + " (auto-generated)"})
-        print("LANGUAGES FOUND:", languages)
-        return jsonify({"languages": languages})
-    except RequestException as e:
-        print("PROXY ERROR:", str(e))
-        return jsonify({"error": "فشل الاتصال بالخادم. يرجى التحقق من إعدادات البروكسي."}), 500
-    except (TranscriptsDisabled, NoTranscriptFound) as e:
-        print("NO TRANSCRIPTS FOUND:", str(e))
-        return jsonify({"error": "No transcripts available for this video."}), 404
-    except VideoUnavailable as e:
-        print("VIDEO UNAVAILABLE:", str(e))
-        return jsonify({"error": "Video unavailable or invalid URL."}), 404
-    except Exception as e:
-        print("UNEXPECTED ERROR:", str(e))
-        if "429" in str(e):
-            return jsonify({"error": "تم تجاوز حد الطلبات المسموح به. يرجى المحاولة بعد قليل."}), 429
-        return jsonify({"error": "Unexpected error: " + str(e)}), 500
 
-def fetch_transcript_with_retry(video_id, lang_code, retries=5, initial_delay=2):
+    try:
+        proxy = PROXY_CONFIG['http'] if PROXY_CONFIG['http'] else None
+        
+        with yt_dlp.YoutubeDL(get_ydl_opts(proxy)) as ydl:
+            info = ydl.extract_info(url, download=False)
+            captions = info.get('subtitles', {})
+            languages = []
+            
+            for lang_code, lang_data in captions.items():
+                if lang_data:
+                    format_data = next(iter(lang_data.values()))
+                    languages.append({
+                        "code": lang_code,
+                        "name": format_data.get('name', lang_code)
+                    })
+            
+            print("LANGUAGES FOUND:", languages)
+            return jsonify({"languages": languages})
+            
+    except Exception as e:
+        print("ERROR:", str(e))
+        return jsonify({"error": "حدث خطأ أثناء جلب الترجمات المتاحة."}), 500
+
+def fetch_transcript_with_retry(url, lang_code, retries=3, initial_delay=2):
     for attempt in range(retries):
         try:
-            # Add random delay before each attempt
             if attempt > 0:
-                delay = initial_delay * (2 ** attempt) + random.uniform(1, 3)
-                print(f"Waiting {delay:.2f} seconds before retry {attempt + 1}")
+                delay = initial_delay * (2 ** attempt)
+                print(f"Waiting {delay} seconds before retry {attempt + 1}")
                 time.sleep(delay)
             
-            # Create a custom session with proxy support
-            session = get_proxy_session()
-            transcript = YouTubeTranscriptApi.get_transcript(
-                video_id,
-                languages=[lang_code],
-                proxies=PROXY_CONFIG if any(PROXY_CONFIG.values()) else None
-            )
-            text = "\n".join([item["text"] for item in transcript])
-            return {"transcript": text}
-        except RequestException as e:
-            print(f"Proxy error on attempt {attempt + 1}: {str(e)}")
-            if attempt < retries - 1:
-                continue
-            return {"error": "فشل الاتصال بالخادم. يرجى التحقق من إعدادات البروكسي."}
+            proxy = PROXY_CONFIG['http'] if PROXY_CONFIG['http'] else None
+            
+            opts = get_ydl_opts(proxy)
+            opts.update({
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': [lang_code],
+                'skip_download': True,
+            })
+            
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                captions = info.get('subtitles', {}).get(lang_code, {})
+                
+                if not captions:
+                    return {"error": "لا توجد ترجمة متاحة بهذه اللغة."}
+                
+                format_data = next(iter(captions.values()))
+                transcript_url = format_data.get('url')
+                
+                if not transcript_url:
+                    return {"error": "لا يمكن الوصول إلى النص."}
+                
+                import requests
+                response = requests.get(transcript_url, proxies={'http': proxy, 'https': proxy} if proxy else None)
+                transcript_data = response.json()
+                
+                text = "\n".join([item['text'] for item in transcript_data['events'] if 'text' in item])
+                return {"transcript": text}
+                
         except Exception as e:
             print(f"Error on attempt {attempt + 1}: {str(e)}")
-            if "429" in str(e):
-                if attempt < retries - 1:
-                    print("Rate limit detected, waiting longer before next attempt...")
-                    continue
-                return {"error": "تم تجاوز حد الطلبات المسموح به. يرجى المحاولة بعد قليل."}
-            if attempt < retries - 1:
-                continue
-            return {"error": "لا توجد ترجمة متاحة بهذه اللغة."}
+            if attempt == retries - 1:
+                return {"error": "فشل في جلب النص. يرجى المحاولة مرة أخرى."}
+    
+    return {"error": "فشل في جلب النص بعد عدة محاولات."}
 
 @app.route("/fetch_transcript", methods=["POST"])
 def fetch_transcript():
-    video_id = request.json.get("video_id")
+    url = request.json.get("url")
     lang_code = request.json.get("lang_code")
-    result = fetch_transcript_with_retry(video_id, lang_code)
+    result = fetch_transcript_with_retry(url, lang_code)
     if "transcript" in result:
         return jsonify({"transcript": result["transcript"]})
     else:
@@ -137,6 +135,7 @@ def download_transcript():
     fmt = request.json.get("format", "txt")
     filename = f"transcript.{fmt}"
     buffer = io.BytesIO()
+    
     if fmt == "srt":
         # تحويل النص إلى صيغة SRT
         transcript = request.json.get("raw", [])
@@ -169,6 +168,7 @@ def download_transcript():
         buffer.write(vtt.encode("utf-8"))
     else:
         buffer.write(text.encode("utf-8"))
+    
     buffer.seek(0)
     return send_file(buffer, as_attachment=True, download_name=filename, mimetype="text/plain")
 
