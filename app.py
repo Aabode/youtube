@@ -34,6 +34,12 @@ def get_ydl_opts(proxy=None):
         'no_warnings': True,
         'extract_flat': True,
         'skip_download': True,
+        'ignoreerrors': True,  # تجاهل الأخطاء غير الحرجة
+        'no_check_certificate': True,  # تجاهل مشاكل الشهادات
+        'geo_bypass': True,  # تجاوز القيود الجغرافية
+        'geo_verification_proxy': proxy if proxy else None,
+        'socket_timeout': 30,  # زيادة وقت الانتظار
+        'retries': 10,  # زيادة عدد المحاولات
     }
     if proxy:
         opts['proxy'] = proxy
@@ -55,20 +61,36 @@ def get_transcripts():
         proxy = PROXY_CONFIG['http'] if PROXY_CONFIG['http'] else None
         
         with yt_dlp.YoutubeDL(get_ydl_opts(proxy)) as ydl:
-            info = ydl.extract_info(url, download=False)
-            captions = info.get('subtitles', {})
-            languages = []
-            
-            for lang_code, lang_data in captions.items():
-                if lang_data:
-                    format_data = next(iter(lang_data.values()))
-                    languages.append({
-                        "code": lang_code,
-                        "name": format_data.get('name', lang_code)
-                    })
-            
-            print("LANGUAGES FOUND:", languages)
-            return jsonify({"languages": languages})
+            try:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    return jsonify({"error": "لم يتم العثور على الفيديو أو غير متاح."}), 404
+                
+                captions = info.get('subtitles', {})
+                languages = []
+                
+                for lang_code, lang_data in captions.items():
+                    if lang_data:
+                        format_data = next(iter(lang_data.values()))
+                        languages.append({
+                            "code": lang_code,
+                            "name": format_data.get('name', lang_code)
+                        })
+                
+                if not languages:
+                    return jsonify({"error": "لا توجد ترجمات متاحة لهذا الفيديو."}), 404
+                
+                print("LANGUAGES FOUND:", languages)
+                return jsonify({"languages": languages})
+                
+            except yt_dlp.utils.DownloadError as e:
+                error_msg = str(e)
+                if "This content isn't available" in error_msg:
+                    return jsonify({"error": "الفيديو غير متاح أو محذوف."}), 404
+                elif "Video unavailable" in error_msg:
+                    return jsonify({"error": "الفيديو غير متاح في منطقتك."}), 404
+                else:
+                    return jsonify({"error": f"حدث خطأ أثناء جلب معلومات الفيديو: {error_msg}"}), 500
             
     except Exception as e:
         print("ERROR:", str(e))
@@ -93,24 +115,44 @@ def fetch_transcript_with_retry(url, lang_code, retries=3, initial_delay=2):
             })
             
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                captions = info.get('subtitles', {}).get(lang_code, {})
-                
-                if not captions:
-                    return {"error": "لا توجد ترجمة متاحة بهذه اللغة."}
-                
-                format_data = next(iter(captions.values()))
-                transcript_url = format_data.get('url')
-                
-                if not transcript_url:
-                    return {"error": "لا يمكن الوصول إلى النص."}
-                
-                import requests
-                response = requests.get(transcript_url, proxies={'http': proxy, 'https': proxy} if proxy else None)
-                transcript_data = response.json()
-                
-                text = "\n".join([item['text'] for item in transcript_data['events'] if 'text' in item])
-                return {"transcript": text}
+                try:
+                    info = ydl.extract_info(url, download=False)
+                    if not info:
+                        return {"error": "لم يتم العثور على الفيديو أو غير متاح."}
+                    
+                    captions = info.get('subtitles', {}).get(lang_code, {})
+                    
+                    if not captions:
+                        return {"error": "لا توجد ترجمة متاحة بهذه اللغة."}
+                    
+                    format_data = next(iter(captions.values()))
+                    transcript_url = format_data.get('url')
+                    
+                    if not transcript_url:
+                        return {"error": "لا يمكن الوصول إلى النص."}
+                    
+                    import requests
+                    response = requests.get(
+                        transcript_url,
+                        proxies={'http': proxy, 'https': proxy} if proxy else None,
+                        timeout=30
+                    )
+                    response.raise_for_status()
+                    transcript_data = response.json()
+                    
+                    text = "\n".join([item['text'] for item in transcript_data['events'] if 'text' in item])
+                    return {"transcript": text}
+                    
+                except yt_dlp.utils.DownloadError as e:
+                    error_msg = str(e)
+                    if "This content isn't available" in error_msg:
+                        return {"error": "الفيديو غير متاح أو محذوف."}
+                    elif "Video unavailable" in error_msg:
+                        return {"error": "الفيديو غير متاح في منطقتك."}
+                    else:
+                        print(f"Download error: {error_msg}")
+                        if attempt == retries - 1:
+                            return {"error": "فشل في جلب النص. يرجى المحاولة مرة أخرى."}
                 
         except Exception as e:
             print(f"Error on attempt {attempt + 1}: {str(e)}")
