@@ -26,9 +26,12 @@ def index():
 @app.route("/get_transcripts", methods=["POST"])
 def get_transcripts():
     url = request.json.get("url")
+    print("URL RECEIVED:", url)
     video_id = extract_video_id(url)
+    print("VIDEO ID:", video_id)
     if not video_id:
-        return jsonify({"error": "الرابط غير صالح."}), 400
+        print("ERROR: Invalid video ID")
+        return jsonify({"error": "Invalid URL."}), 400
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         languages = [
@@ -36,14 +39,18 @@ def get_transcripts():
         ]
         # إضافة الترجمات التلقائية
         for t in transcript_list._generated_transcripts.values():
-            languages.append({"code": t.language_code, "name": t.language + " (تلقائي)"})
+            languages.append({"code": t.language_code, "name": t.language + " (auto-generated)"})
+        print("LANGUAGES FOUND:", languages)
         return jsonify({"languages": languages})
-    except (TranscriptsDisabled, NoTranscriptFound):
-        return jsonify({"error": "لا توجد ترجمات متاحة لهذا الفيديو."}), 404
-    except VideoUnavailable:
-        return jsonify({"error": "الفيديو غير متاح أو الرابط غير صحيح."}), 404
+    except (TranscriptsDisabled, NoTranscriptFound) as e:
+        print("NO TRANSCRIPTS FOUND:", str(e))
+        return jsonify({"error": "No transcripts available for this video."}), 404
+    except VideoUnavailable as e:
+        print("VIDEO UNAVAILABLE:", str(e))
+        return jsonify({"error": "Video unavailable or invalid URL."}), 404
     except Exception as e:
-        return jsonify({"error": "حدث خطأ غير متوقع."}), 500
+        print("UNEXPECTED ERROR:", str(e))
+        return jsonify({"error": "Unexpected error: " + str(e)}), 500
 
 def fetch_transcript_with_retry(video_id, lang_code, retries=3, delay=1):
     for attempt in range(retries):
