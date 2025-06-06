@@ -3,8 +3,24 @@ from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, No
 import re
 import io
 import time
+import requests
+from requests.exceptions import RequestException
+import os
 
 app = Flask(__name__)
+
+# Proxy configuration
+PROXY_CONFIG = {
+    'http': os.getenv('HTTP_PROXY', ''),
+    'https': os.getenv('HTTPS_PROXY', '')
+}
+
+# Custom session with proxy support
+def get_proxy_session():
+    session = requests.Session()
+    if any(PROXY_CONFIG.values()):
+        session.proxies.update(PROXY_CONFIG)
+    return session
 
 def extract_video_id(url):
     # يدعم جميع أنواع روابط يوتيوب (عادي، شورتس، مع معلمات)
@@ -33,7 +49,12 @@ def get_transcripts():
         print("ERROR: Invalid video ID")
         return jsonify({"error": "Invalid URL."}), 400
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        # Create a custom session with proxy support
+        session = get_proxy_session()
+        transcript_list = YouTubeTranscriptApi.list_transcripts(
+            video_id,
+            proxies=PROXY_CONFIG if any(PROXY_CONFIG.values()) else None
+        )
         languages = [
             {"code": t.language_code, "name": t.language} for t in transcript_list._manually_created_transcripts.values()
         ]
@@ -42,6 +63,9 @@ def get_transcripts():
             languages.append({"code": t.language_code, "name": t.language + " (auto-generated)"})
         print("LANGUAGES FOUND:", languages)
         return jsonify({"languages": languages})
+    except RequestException as e:
+        print("PROXY ERROR:", str(e))
+        return jsonify({"error": "فشل الاتصال بالخادم. يرجى التحقق من إعدادات البروكسي."}), 500
     except (TranscriptsDisabled, NoTranscriptFound) as e:
         print("NO TRANSCRIPTS FOUND:", str(e))
         return jsonify({"error": "No transcripts available for this video."}), 404
@@ -55,12 +79,25 @@ def get_transcripts():
 def fetch_transcript_with_retry(video_id, lang_code, retries=3, delay=1):
     for attempt in range(retries):
         try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang_code])
+            # Create a custom session with proxy support
+            session = get_proxy_session()
+            transcript = YouTubeTranscriptApi.get_transcript(
+                video_id,
+                languages=[lang_code],
+                proxies=PROXY_CONFIG if any(PROXY_CONFIG.values()) else None
+            )
             text = "\n".join([item["text"] for item in transcript])
             return {"transcript": text}
-        except Exception:
+        except RequestException as e:
+            print(f"Proxy error on attempt {attempt + 1}: {str(e)}")
             if attempt < retries - 1:
-                time.sleep(delay)
+                time.sleep(delay * (attempt + 1))  # Exponential backoff
+            else:
+                return {"error": "فشل الاتصال بالخادم. يرجى التحقق من إعدادات البروكسي."}
+        except Exception as e:
+            print(f"Error on attempt {attempt + 1}: {str(e)}")
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))
             else:
                 return {"error": "لا توجد ترجمة متاحة بهذه اللغة."}
 
