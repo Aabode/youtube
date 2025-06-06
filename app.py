@@ -3,7 +3,8 @@ import re
 import io
 import time
 import os
-import yt_dlp
+import requests
+from pytube import YouTube
 import json
 
 app = Flask(__name__)
@@ -27,23 +28,14 @@ def extract_video_id(url):
             return match.group(1)
     return None
 
-def get_ydl_opts(proxy=None):
-    """Get yt-dlp options with proxy support"""
-    opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-        'skip_download': True,
-        'ignoreerrors': True,  # تجاهل الأخطاء غير الحرجة
-        'no_check_certificate': True,  # تجاهل مشاكل الشهادات
-        'geo_bypass': True,  # تجاوز القيود الجغرافية
-        'geo_verification_proxy': proxy if proxy else None,
-        'socket_timeout': 30,  # زيادة وقت الانتظار
-        'retries': 10,  # زيادة عدد المحاولات
-    }
-    if proxy:
-        opts['proxy'] = proxy
-    return opts
+def get_proxy_dict():
+    """Get proxy dictionary for requests"""
+    if PROXY_CONFIG['http']:
+        return {
+            'http': PROXY_CONFIG['http'],
+            'https': PROXY_CONFIG['https'] or PROXY_CONFIG['http']
+        }
+    return None
 
 @app.route("/")
 def index():
@@ -58,43 +50,40 @@ def get_transcripts():
         return jsonify({"error": "Invalid URL."}), 400
 
     try:
-        proxy = PROXY_CONFIG['http'] if PROXY_CONFIG['http'] else None
+        # Configure YouTube with proxy if available
+        proxy = get_proxy_dict()
+        yt = YouTube(
+            url,
+            use_oauth=False,
+            allow_oauth_cache=True,
+            proxies=proxy
+        )
         
-        with yt_dlp.YoutubeDL(get_ydl_opts(proxy)) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-                if not info:
-                    return jsonify({"error": "لم يتم العثور على الفيديو أو غير متاح."}), 404
-                
-                captions = info.get('subtitles', {})
-                languages = []
-                
-                for lang_code, lang_data in captions.items():
-                    if lang_data:
-                        format_data = next(iter(lang_data.values()))
-                        languages.append({
-                            "code": lang_code,
-                            "name": format_data.get('name', lang_code)
-                        })
-                
-                if not languages:
-                    return jsonify({"error": "لا توجد ترجمات متاحة لهذا الفيديو."}), 404
-                
-                print("LANGUAGES FOUND:", languages)
-                return jsonify({"languages": languages})
-                
-            except yt_dlp.utils.DownloadError as e:
-                error_msg = str(e)
-                if "This content isn't available" in error_msg:
-                    return jsonify({"error": "الفيديو غير متاح أو محذوف."}), 404
-                elif "Video unavailable" in error_msg:
-                    return jsonify({"error": "الفيديو غير متاح في منطقتك."}), 404
-                else:
-                    return jsonify({"error": f"حدث خطأ أثناء جلب معلومات الفيديو: {error_msg}"}), 500
+        # Get available captions
+        captions = yt.captions
+        languages = []
+        
+        for lang_code, caption in captions.items():
+            languages.append({
+                "code": lang_code,
+                "name": caption.name
+            })
+        
+        if not languages:
+            return jsonify({"error": "لا توجد ترجمات متاحة لهذا الفيديو."}), 404
+        
+        print("LANGUAGES FOUND:", languages)
+        return jsonify({"languages": languages})
             
     except Exception as e:
         print("ERROR:", str(e))
-        return jsonify({"error": "حدث خطأ أثناء جلب الترجمات المتاحة."}), 500
+        error_msg = str(e)
+        if "Video unavailable" in error_msg:
+            return jsonify({"error": "الفيديو غير متاح أو محذوف."}), 404
+        elif "Private video" in error_msg:
+            return jsonify({"error": "هذا الفيديو خاص."}), 403
+        else:
+            return jsonify({"error": "حدث خطأ أثناء جلب الترجمات المتاحة."}), 500
 
 def fetch_transcript_with_retry(url, lang_code, retries=3, initial_delay=2):
     for attempt in range(retries):
@@ -104,59 +93,39 @@ def fetch_transcript_with_retry(url, lang_code, retries=3, initial_delay=2):
                 print(f"Waiting {delay} seconds before retry {attempt + 1}")
                 time.sleep(delay)
             
-            proxy = PROXY_CONFIG['http'] if PROXY_CONFIG['http'] else None
+            proxy = get_proxy_dict()
+            yt = YouTube(
+                url,
+                use_oauth=False,
+                allow_oauth_cache=True,
+                proxies=proxy
+            )
             
-            opts = get_ydl_opts(proxy)
-            opts.update({
-                'writesubtitles': True,
-                'writeautomaticsub': True,
-                'subtitleslangs': [lang_code],
-                'skip_download': True,
-            })
+            caption = yt.captions.get(lang_code)
+            if not caption:
+                return {"error": "لا توجد ترجمة متاحة بهذه اللغة."}
             
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                try:
-                    info = ydl.extract_info(url, download=False)
-                    if not info:
-                        return {"error": "لم يتم العثور على الفيديو أو غير متاح."}
-                    
-                    captions = info.get('subtitles', {}).get(lang_code, {})
-                    
-                    if not captions:
-                        return {"error": "لا توجد ترجمة متاحة بهذه اللغة."}
-                    
-                    format_data = next(iter(captions.values()))
-                    transcript_url = format_data.get('url')
-                    
-                    if not transcript_url:
-                        return {"error": "لا يمكن الوصول إلى النص."}
-                    
-                    import requests
-                    response = requests.get(
-                        transcript_url,
-                        proxies={'http': proxy, 'https': proxy} if proxy else None,
-                        timeout=30
-                    )
-                    response.raise_for_status()
-                    transcript_data = response.json()
-                    
-                    text = "\n".join([item['text'] for item in transcript_data['events'] if 'text' in item])
-                    return {"transcript": text}
-                    
-                except yt_dlp.utils.DownloadError as e:
-                    error_msg = str(e)
-                    if "This content isn't available" in error_msg:
-                        return {"error": "الفيديو غير متاح أو محذوف."}
-                    elif "Video unavailable" in error_msg:
-                        return {"error": "الفيديو غير متاح في منطقتك."}
-                    else:
-                        print(f"Download error: {error_msg}")
-                        if attempt == retries - 1:
-                            return {"error": "فشل في جلب النص. يرجى المحاولة مرة أخرى."}
+            # Get the transcript
+            transcript = caption.generate_srt_captions()
+            
+            # Convert SRT to plain text
+            lines = transcript.split('\n')
+            text_lines = []
+            for line in lines:
+                if not line.strip().isdigit() and not '-->' in line and line.strip():
+                    text_lines.append(line.strip())
+            
+            text = '\n'.join(text_lines)
+            return {"transcript": text}
                 
         except Exception as e:
             print(f"Error on attempt {attempt + 1}: {str(e)}")
-            if attempt == retries - 1:
+            error_msg = str(e)
+            if "Video unavailable" in error_msg:
+                return {"error": "الفيديو غير متاح أو محذوف."}
+            elif "Private video" in error_msg:
+                return {"error": "هذا الفيديو خاص."}
+            elif attempt == retries - 1:
                 return {"error": "فشل في جلب النص. يرجى المحاولة مرة أخرى."}
     
     return {"error": "فشل في جلب النص بعد عدة محاولات."}
