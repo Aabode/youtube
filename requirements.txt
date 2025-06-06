@@ -1,4 +1,4 @@
 Flask
-youtube-transcript-api
-gunicorn 
-requests
+yt-dlp==2025.5.22
+requests==2.31.0
+gunicorn
