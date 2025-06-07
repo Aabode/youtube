@@ -77,6 +77,7 @@ CALLS = 50
 RATE_LIMIT_PERIOD = 60
 
 def get_session():
+    global proxy_list, proxy_pool  # يجب أن يكون في أول الدالة
     """Create a session with configured headers and proxy"""
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
@@ -90,7 +91,6 @@ def get_session():
             }
         except StopIteration:
             # If we've gone through all proxies, refresh the list
-            global proxy_list, proxy_pool
             proxy_list = get_proxy_list()
             proxy_pool = cycle(proxy_list) if proxy_list else None
     
@@ -169,10 +169,7 @@ def get_transcripts():
     try:
         # Create a custom session with proxy support
         session = get_session()
-        transcript_list = YouTubeTranscriptApi.list_transcripts(
-            video_id,
-            proxies=PROXY_CONFIG if any(PROXY_CONFIG.values()) else None
-        )
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         languages = [
             {"code": t.language_code, "name": t.language} for t in transcript_list._manually_created_transcripts.values()
         ]
@@ -209,8 +206,7 @@ def fetch_transcript_with_retry(video_id, lang_code, retries=5, initial_delay=2)
             session = get_session()
             transcript = YouTubeTranscriptApi.get_transcript(
                 video_id,
-                languages=[lang_code],
-                proxies=PROXY_CONFIG if any(PROXY_CONFIG.values()) else None
+                languages=[lang_code]
             )
             text = "\n".join([item["text"] for item in transcript])
             return {"transcript": text}
@@ -310,6 +306,9 @@ def get_transcript():
             
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+def random_delay():
+    time.sleep(random.uniform(1, 3))
 
 if __name__ == "__main__":
     app.run(debug=True) 
