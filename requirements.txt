@@ -1,3 +1,7 @@
 Flask
 youtube-transcript-api
-gunicorn 
+gunicorn
+requests
+python-dotenv
+redis
+ratelimit 
