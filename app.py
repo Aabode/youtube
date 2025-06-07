@@ -20,13 +20,16 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# Initialize Redis for caching
-redis_client = redis.Redis(
-    host=os.getenv('REDIS_HOST', 'localhost'),
-    port=int(os.getenv('REDIS_PORT', 6379)),
-    password=os.getenv('REDIS_PASSWORD', None),
-    decode_responses=True
-)
+# Initialize Redis for caching (اختياري)
+redis_client = None
+try:
+    redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+    redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+    redis_client.ping()
+    print("Redis connection successful!")
+except Exception as e:
+    print(f"Redis not available: {e}")
+    redis_client = None
 
 # Proxy configuration
 PROXY_LIST_URL = "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt"
@@ -35,20 +38,26 @@ PROXY_CACHE_DURATION = 3600  # 1 hour in seconds
 
 def get_proxy_list():
     """Get proxy list from cache or fetch from URL"""
-    cached_proxies = redis_client.get(PROXY_CACHE_KEY)
-    if cached_proxies:
-        return json.loads(cached_proxies)
-    
+    if redis_client:
+        try:
+            cached_proxies = redis_client.get(PROXY_CACHE_KEY)
+            if cached_proxies:
+                return json.loads(cached_proxies)
+        except Exception as e:
+            print(f"Redis error: {e}")
     try:
         response = requests.get(PROXY_LIST_URL, timeout=10)
         if response.status_code == 200:
             proxies = [line.strip() for line in response.text.splitlines() if line.strip()]
             # Cache the proxy list
-            redis_client.setex(PROXY_CACHE_KEY, PROXY_CACHE_DURATION, json.dumps(proxies))
+            if redis_client:
+                try:
+                    redis_client.setex(PROXY_CACHE_KEY, PROXY_CACHE_DURATION, json.dumps(proxies))
+                except Exception as e:
+                    print(f"Redis set error: {e}")
             return proxies
     except Exception as e:
         print(f"Error fetching proxy list: {e}")
-    
     return []
 
 # Initialize proxy pool
@@ -122,17 +131,23 @@ def get_transcript_with_retry(video_id, language_code=None):
 def get_cached_transcript(video_id, language_code=None):
     """Get transcript from cache or fetch and cache it"""
     cache_key = f"transcript:{video_id}:{language_code or 'default'}"
-    cached_transcript = redis_client.get(cache_key)
-    
+    cached_transcript = None
+    if redis_client:
+        try:
+            cached_transcript = redis_client.get(cache_key)
+        except Exception as e:
+            print(f"Redis error: {e}")
     if cached_transcript:
         return cached_transcript
-    
     transcript = get_transcript_with_retry(video_id, language_code)
     formatter = TextFormatter()
     formatted_transcript = formatter.format_transcript(transcript)
-    
     # Cache for 24 hours
-    redis_client.setex(cache_key, 86400, formatted_transcript)
+    if redis_client:
+        try:
+            redis_client.setex(cache_key, 86400, formatted_transcript)
+        except Exception as e:
+            print(f"Redis set error: {e}")
     return formatted_transcript
 
 def extract_video_id(url):
